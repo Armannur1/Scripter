@@ -1,0 +1,389 @@
+-- PiggyESP v3 (performance build) - for use with the developer's permission.
+-- Put in StarterPlayer > StarterPlayerScripts as a LocalScript.
+--   Bots:           anything inside workspace.PiggyNpc
+--   Piggy (player): character with an "Enemy" child  (player + infection mode)
+--   Traitor:        character with a "Traitor" child
+-- Toggle with RightShift or the on-screen button. Set DEBUG = true for console logs.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+local TOGGLE_KEY = Enum.KeyCode.RightShift -- change to any key you like
+local DEBUG = false
+local enabled = true
+
+-- Trap folder: a Folder directly in workspace whose name is all digits (the number
+-- changes every time). Traps have letters in their name; other items are numbers only.
+local function isTrapFolder(inst)
+	return inst:IsA("Folder") and inst.Name:match("^%d+$") ~= nil
+end
+local watchedTrapFolders = {} -- [folder] = true
+local function isTrapName(name)
+	return name:find("%a") ~= nil
+end
+
+local function dbg(...)
+	if DEBUG then print("[PiggyESP]", ...) end
+end
+
+--------------------------------------------------------------------
+-- 1. DETECTORS
+--------------------------------------------------------------------
+local DETECTORS = {
+	{
+		label = "Bot Piggy", color = Color3.fromRGB(255, 80, 80),
+		check = function(model, player)
+			if player then return false end
+			local parent = model.Parent
+			return parent ~= nil and parent.Name:lower() == "piggynpc"
+		end,
+	},
+	{
+		label = "Piggy (Player)", color = Color3.fromRGB(255, 140, 0),
+		check = function(model, player)
+			return model:FindFirstChild("Enemy") ~= nil and model:FindFirstChild("Traitor") == nil
+		end,
+	},
+	{
+		label = "Traitor", color = Color3.fromRGB(190, 60, 255),
+		check = function(model, player)
+			return model:FindFirstChild("Traitor") ~= nil
+		end,
+	},
+	{
+		label = "Trap (Object)", color = Color3.fromRGB(255, 220, 0),
+		check = function(model, player)
+			local parent = model.Parent
+			return parent ~= nil and watchedTrapFolders[parent] == true
+				and model:IsA("BasePart") and isTrapName(model.Name)
+		end,
+	},
+	{
+		label = "Trap (NPC)", color = Color3.fromRGB(0, 220, 255),
+		check = function(model, player)
+			local parent = model.Parent
+			return parent ~= nil and watchedTrapFolders[parent] == true
+				and model:IsA("Model") and isTrapName(model.Name)
+		end,
+	},
+}
+
+-- Only these child names trigger a re-check of a player model
+local MARKERS = { Enemy = true, Traitor = true }
+
+--------------------------------------------------------------------
+-- 2. ESP core
+--------------------------------------------------------------------
+local tracked = {} -- [model] = {highlight, gui, label, detector, root, text, conns}
+
+local function getPlayer(model)
+	if not model:IsA("Model") then return nil end
+	local p = Players:GetPlayerFromCharacter(model)
+	if p then return p end
+	if model.Parent == workspace then
+		local byName = Players:FindFirstChild(model.Name)
+		if byName and byName:IsA("Player") then return byName end
+	end
+end
+
+local function pickPart(model)
+	if model:IsA("BasePart") then return model end
+	return model:FindFirstChild("Head")
+		or model:FindFirstChild("HumanoidRootPart")
+		or model.PrimaryPart
+		or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function hide(t)
+	if t.highlight then t.highlight.Enabled = false end
+	if t.gui then t.gui.Enabled = false end
+	t.detector = nil
+end
+
+local function clear(model)
+	local t = tracked[model]
+	if not t then return end
+	if t.highlight then t.highlight:Destroy() end
+	if t.gui then t.gui:Destroy() end
+	for _, c in ipairs(t.conns) do c:Disconnect() end
+	tracked[model] = nil
+	dbg("cleared", model.Name)
+end
+
+local function evaluate(model)
+	local t = tracked[model]
+	if not t then return end
+
+	if not enabled then
+		if t.detector then hide(t) end
+		return
+	end
+
+	local player = getPlayer(model)
+	if player == LocalPlayer then return end
+
+	local found
+	for _, d in ipairs(DETECTORS) do
+		local ok, res = pcall(d.check, model, player)
+		if not ok then
+			warn("[PiggyESP] detector error (" .. d.label .. "):", res)
+		elseif res then
+			found = d
+			break
+		end
+	end
+
+	if not found then
+		if t.detector then hide(t) end
+		return
+	end
+
+	-- nothing changed since last time: do no work
+	if t.detector == found then
+		if t.gui and not t.gui.Adornee then t.gui.Adornee = pickPart(model) end
+		return
+	end
+
+	dbg("flagged", model.Name, "as", found.label)
+	t.detector = found
+	t.text = nil
+
+	if not t.highlight then
+		local hl = Instance.new("Highlight")
+		hl.Adornee = model
+		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hl.FillTransparency = 0.6
+		hl.Parent = model
+		t.highlight = hl
+
+		local gui = Instance.new("BillboardGui")
+		gui.Size = UDim2.fromOffset(160, 36)
+		gui.StudsOffset = Vector3.new(0, 3, 0)
+		gui.AlwaysOnTop = true
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.fromScale(1, 1)
+		lbl.BackgroundTransparency = 1
+		lbl.TextStrokeTransparency = 0
+		lbl.TextScaled = true
+		lbl.Parent = gui
+		gui.Parent = model
+		t.gui, t.label = gui, lbl
+	end
+
+	if not t.gui.Adornee then t.gui.Adornee = pickPart(model) end
+
+	t.highlight.FillColor = found.color
+	t.highlight.OutlineColor = found.color
+	t.label.TextColor3 = found.color
+	t.label.Text = found.label
+	t.highlight.Enabled = true
+	t.gui.Enabled = true
+end
+
+local function track(model)
+	if not model or tracked[model] then return end
+	if not (model:IsA("Model") or model:IsA("BasePart")) then return end
+	local t = { conns = {} }
+	tracked[model] = t
+	dbg("tracking", model.Name)
+
+	local function re() evaluate(model) end
+	table.insert(t.conns, model.ChildAdded:Connect(function(c)
+		if MARKERS[c.Name] then re() end
+	end))
+	table.insert(t.conns, model.ChildRemoved:Connect(function(c)
+		if MARKERS[c.Name] then re() end
+	end))
+	table.insert(t.conns, model.AncestryChanged:Connect(function(_, parent)
+		if not parent then clear(model) else re() end
+	end))
+	re()
+end
+
+--------------------------------------------------------------------
+-- 3. Sources of targets
+--------------------------------------------------------------------
+-- Bots: everything that appears directly in workspace.PiggyNpc
+local watchedFolders = {}
+local function watchBotFolder(folder)
+	if watchedFolders[folder] then return end
+	watchedFolders[folder] = true
+	dbg("watching PiggyNpc folder")
+	folder.ChildAdded:Connect(function(child)
+		task.defer(track, child)
+	end)
+	for _, child in ipairs(folder:GetChildren()) do track(child) end
+end
+
+for _, c in ipairs(workspace:GetChildren()) do
+	if c.Name:lower() == "piggynpc" then watchBotFolder(c) end
+end
+
+-- Traps: letter-named items inside the trap folder (parts and NPC models)
+local function watchTrapFolder(folder)
+	if watchedTrapFolders[folder] then return end
+	watchedTrapFolders[folder] = true
+	dbg("watching trap folder")
+	folder.ChildAdded:Connect(function(child)
+		task.defer(function()
+			if isTrapName(child.Name) then track(child) end
+		end)
+	end)
+	for _, child in ipairs(folder:GetChildren()) do
+		if isTrapName(child.Name) then track(child) end
+	end
+end
+for _, c in ipairs(workspace:GetChildren()) do
+	if isTrapFolder(c) then watchTrapFolder(c) end
+end
+
+-- Players: every other player's character
+local function watchPlayer(player)
+	if player == LocalPlayer then return end
+	player.CharacterAdded:Connect(function(char)
+		task.defer(track, char)
+	end)
+	if player.Character then track(player.Character) end
+end
+for _, p in ipairs(Players:GetPlayers()) do watchPlayer(p) end
+Players.PlayerAdded:Connect(watchPlayer)
+
+-- Workspace children: a (re)created PiggyNpc folder, or a player model that
+-- was swapped in without firing CharacterAdded (models sit under the player's name)
+local function onWorkspaceChild(child)
+	if child.Name:lower() == "piggynpc" then
+		watchBotFolder(child)
+	elseif child:IsA("Folder") then
+		task.defer(function()
+			if isTrapFolder(child) then watchTrapFolder(child) end
+		end)
+	elseif child:IsA("Model") and child.Name ~= LocalPlayer.Name and Players:FindFirstChild(child.Name) then
+		task.defer(track, child)
+	end
+end
+workspace.ChildAdded:Connect(onWorkspaceChild)
+for _, child in ipairs(workspace:GetChildren()) do
+	if child:IsA("Model") then onWorkspaceChild(child) end
+end
+
+-- Safety net: cheap re-check of tracked models once a second
+task.spawn(function()
+	while true do
+		task.wait(1)
+		for model in pairs(tracked) do evaluate(model) end
+	end
+end)
+
+-- Distance text: 5 times a second, only touches the label when the text changes
+local acc = 0
+RunService.Heartbeat:Connect(function(dt)
+	acc += dt
+	if acc < 0.2 then return end
+	acc = 0
+	if not enabled then return end
+	local char = LocalPlayer.Character
+	local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+	if not myRoot then return end
+	local myPos = myRoot.Position
+	for model, t in pairs(tracked) do
+		local det = t.detector
+		if det and t.label then
+			local r = t.root
+			if not r or not r.Parent then
+				if model:IsA("BasePart") then
+					r = model
+				else
+					r = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+				end
+				t.root = r
+			end
+			if r then
+				local text = string.format("%s [%d]", det.label, (r.Position - myPos).Magnitude)
+				if t.text ~= text then
+					t.text = text
+					t.label.Text = text
+				end
+			end
+		end
+	end
+end)
+
+--------------------------------------------------------------------
+-- 4. Toggle: key + on-screen button
+--------------------------------------------------------------------
+local button -- created below
+
+local function setEnabled(v)
+	enabled = v
+	dbg("enabled =", enabled)
+	for model in pairs(tracked) do evaluate(model) end
+	if button then
+		button.Text = enabled and "ESP: ON" or "ESP: OFF"
+		button.BackgroundColor3 = enabled and Color3.fromRGB(40, 160, 70) or Color3.fromRGB(170, 50, 50)
+	end
+end
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or input.KeyCode ~= TOGGLE_KEY then return end
+	setEnabled(not enabled)
+end)
+
+-- On-screen toggle button (click to toggle, drag to move)
+task.spawn(function()
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "PiggyESPToggle"
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 999
+
+	button = Instance.new("TextButton")
+	button.Size = UDim2.fromOffset(110, 36)
+	button.Position = UDim2.new(1, -126, 0, 70)
+	button.AutoButtonColor = false
+	button.Font = Enum.Font.GothamBold
+	button.TextSize = 16
+	button.TextColor3 = Color3.new(1, 1, 1)
+	button.Text = enabled and "ESP: ON" or "ESP: OFF"
+	button.BackgroundColor3 = enabled and Color3.fromRGB(40, 160, 70) or Color3.fromRGB(170, 50, 50)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = button
+	button.Parent = gui
+
+	local dragStart, startPos, moved
+	local function isPointer(input)
+		return input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch
+	end
+
+	button.InputBegan:Connect(function(input)
+		if isPointer(input) then
+			dragStart = input.Position
+			startPos = button.Position
+			moved = false
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragStart then return end
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			if delta.Magnitude > 6 then moved = true end
+			if moved then
+				button.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
+					startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+			end
+		end
+	end)
+	button.InputEnded:Connect(function(input)
+		if isPointer(input) then
+			if dragStart and not moved then setEnabled(not enabled) end
+			dragStart = nil
+		end
+	end)
+
+	gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+end)
+
+dbg("started")
