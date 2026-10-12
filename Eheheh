@@ -1,92 +1,77 @@
--- PiggyESP v3 (performance build) - for use with the developer's permission.
--- Put in StarterPlayer > StarterPlayerScripts as a LocalScript.
---   Bots:           anything inside workspace.PiggyNpc
---   Piggy (player): character with an "Enemy" child  (player + infection mode)
---   Traitor:        character with a "Traitor" child
--- Toggle with RightShift or the on-screen button. Set DEBUG = true for console logs.
+-- PiggyESP v4 (LocalScript) - for use with the developer's permission.
+-- Put in StarterPlayer > StarterPlayerScripts.
+--
+-- Categories (each can be switched on/off in the menu; an OFF category has no
+-- outlines, labels or per-frame work at all):
+--   Player piggy  character with an "Enemy" child            (red)
+--   Bot piggy     anything inside workspace.PiggyNpc          (blue)
+--   Trap          part-type traps in the item folder          (purple)
+--   NPC trap      model-type traps in the item folder         (dark red)
+--   Traitor       character with a "Traitor" child            (orange)
+--   Ability       TrickOrTreat, Flare, Crafty, Radar, Warp, Decoy... (green)
+--   Item          everything else directly in the item folder (yellow)
+-- The item folder is found by shape: a workspace child named "ItemFolder" or
+-- all digits (the game renames it).
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
-local TOGGLE_KEY = Enum.KeyCode.RightShift -- change to any key you like
 local DEBUG = false
-local enabled = true
-
--- Trap container: something directly in workspace whose name is all digits (the number
--- changes every time). Anything inside it with "trap" in its name (any depth) is a trap.
-local function isTrapFolder(inst)
-	if Players:FindFirstChild(inst.Name) then return false end
-	return inst.Name == "ItemFolder" or inst.Name:match("^%d+$") ~= nil
-end
-local watchedTrapFolders = {} -- [folder] = true
-local trapTargets = setmetatable({}, { __mode = "k" }) -- [instance] = true
--- Edit these lists to tune what counts as a trap (not case sensitive, matches part of the name)
-local TRAP_KEYWORDS = { "trap", "piggy" }
-local TRAP_EXCLUDE = {} -- e.g. { "trapdoor", "poster" } to ignore items you don't want marked
-local function isTrapName(name)
-	local n = name:lower()
-	for _, ex in ipairs(TRAP_EXCLUDE) do
-		if n:find(ex, 1, true) then return false end
-	end
-	for _, kw in ipairs(TRAP_KEYWORDS) do
-		if n:find(kw, 1, true) then return true end
-	end
-	return false
-end
-
 local function dbg(...)
 	if DEBUG then print("[PiggyESP]", ...) end
 end
 
 --------------------------------------------------------------------
--- 1. DETECTORS
+-- CONFIG (edit freely)
 --------------------------------------------------------------------
-local DETECTORS = {
-	{
-		label = "Bot Piggy", color = Color3.fromRGB(255, 80, 80),
-		check = function(model, player)
-			if player then return false end
-			local parent = model.Parent
-			return parent ~= nil and parent.Name:lower() == "piggynpc"
-		end,
-	},
-	{
-		label = "Piggy (Player)", color = Color3.fromRGB(255, 140, 0),
-		check = function(model, player)
-			return model:FindFirstChild("Enemy") ~= nil and model:FindFirstChild("Traitor") == nil
-		end,
-	},
-	{
-		label = "Traitor", color = Color3.fromRGB(190, 60, 255),
-		check = function(model, player)
-			return model:FindFirstChild("Traitor") ~= nil
-		end,
-	},
-	{
-		label = "Trap (Object)", color = Color3.fromRGB(255, 220, 0),
-		check = function(model, player)
-			local parent = model.Parent
-			return trapTargets[model] == true and model:IsA("BasePart")
-		end,
-	},
-	{
-		label = "Trap (NPC)", color = Color3.fromRGB(0, 220, 255),
-		check = function(model, player)
-			local parent = model.Parent
-			return trapTargets[model] == true and model:IsA("Model")
-		end,
-	},
+local CATEGORIES = {
+	{ key = "player",  label = "Player piggy", color = Color3.fromRGB(255, 50, 50),  default = true },
+	{ key = "bot",     label = "Bot piggy",    color = Color3.fromRGB(60, 130, 255), default = true },
+	{ key = "trap",    label = "Trap",         color = Color3.fromRGB(170, 80, 255), default = true },
+	{ key = "npctrap", label = "NPC trap",     color = Color3.fromRGB(150, 0, 0),    default = true },
+	{ key = "traitor", label = "Traitor",      color = Color3.fromRGB(255, 140, 0),  default = true },
+	{ key = "ability", label = "Ability",      color = Color3.fromRGB(60, 220, 90),  default = false },
+	{ key = "item",    label = "Item",         color = Color3.fromRGB(255, 225, 40), default = false },
 }
 
--- Only these child names trigger a re-check of a player model
-local MARKERS = { Enemy = true, Traitor = true }
+-- Settings defaults
+local settings = {
+	fill = false,      -- colored fill inside the outline
+	distance = true,   -- show [distance] in labels
+	hideFar = false,   -- hide outlines/labels beyond farDist
+	farDist = 150,     -- studs (changeable in the menu, steps of 25)
+}
+
+-- Name matching (not case sensitive, matches part of the name)
+local TRAP_KEYWORDS = { "trap", "piggy" }
+local TRAP_EXCLUDE = {}                       -- e.g. { "trapdoor" }
+local NPC_TRAP_NAMES = { "crawltrap" }        -- always NPC trap (also catches CrawlTrapAlt)
+local ABILITY_KEYWORDS = { "trickortreat", "flare", "crafty", "radar", "warp", "decoy", "disarm" }
 
 --------------------------------------------------------------------
--- 2. ESP core
+-- State
 --------------------------------------------------------------------
-local tracked = {} -- [model] = {highlight, gui, label, detector, root, text, conns}
+local masterOn = true
+local on, COLOR = {}, {}
+for _, c in ipairs(CATEGORIES) do
+	on[c.key] = c.default
+	COLOR[c.key] = c.color
+end
+
+local MARKERS = { Enemy = true, Traitor = true }
+local tracked = {} -- [instance] = {source, direct, cat, name, hl, gui, label, root, text, far, conns}
+
+--------------------------------------------------------------------
+-- Helpers
+--------------------------------------------------------------------
+local function hasKeyword(lname, list)
+	for i = 1, #list do
+		if lname:find(list[i], 1, true) then return true end
+	end
+	return false
+end
 
 local function getPlayer(model)
 	if not model:IsA("Model") then return nil end
@@ -106,311 +91,598 @@ local function pickPart(model)
 		or model:FindFirstChildWhichIsA("BasePart", true)
 end
 
-local function hide(t)
-	if t.highlight then t.highlight.Enabled = false end
-	if t.gui then t.gui.Enabled = false end
-	t.detector = nil
+local function getRoot(model, t)
+	local r = t.root
+	if r and r.Parent then return r end
+	if model:IsA("BasePart") then
+		r = model
+	else
+		r = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+			or model:FindFirstChildWhichIsA("BasePart", true)
+	end
+	t.root = r
+	return r
+end
+
+local function displayName(model, t)
+	if t.source == "player" then
+		local p = getPlayer(model)
+		return p and p.Name or model.Name
+	end
+	local n = model.Name
+	if n:match("^%d+$") then return "Item" end
+	return n
+end
+
+--------------------------------------------------------------------
+-- Classification: which category is this target in right now?
+--------------------------------------------------------------------
+local function classify(model, t)
+	local src = t.source
+	if src == "player" then
+		if model:FindFirstChild("Traitor") then return "traitor" end
+		if model:FindFirstChild("Enemy") then return "player" end
+		return nil
+	end
+
+	local lname = model.Name:lower()
+
+	if src == "bot" then
+		if hasKeyword(lname, ABILITY_KEYWORDS) then return "ability" end -- "Decoy" lives here
+		return "bot"
+	end
+
+	-- source == "folder" (the item folder)
+	if hasKeyword(lname, NPC_TRAP_NAMES) then return "npctrap" end
+	if hasKeyword(lname, ABILITY_KEYWORDS) then return "ability" end
+	if hasKeyword(lname, TRAP_KEYWORDS) and not hasKeyword(lname, TRAP_EXCLUDE) then
+		return model:IsA("Model") and "npctrap" or "trap"
+	end
+	if t.direct then return "item" end
+	return nil
+end
+
+--------------------------------------------------------------------
+-- Visuals (only exist while the category is on)
+--------------------------------------------------------------------
+local function removeVisuals(t)
+	if t.hl then t.hl:Destroy() t.hl = nil end
+	if t.gui then t.gui:Destroy() t.gui = nil t.label = nil end
+	t.text, t.far = nil, nil
+end
+
+local function applyVisuals(model, t)
+	local cat = t.cat
+	if not (masterOn and cat and on[cat]) then
+		if t.hl then removeVisuals(t) end
+		return
+	end
+	if not model.Parent then return end
+
+	local color = COLOR[cat]
+	if not t.hl then
+		local hl = Instance.new("Highlight")
+		hl.Adornee = model
+		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hl.OutlineTransparency = 0
+		hl.Parent = model
+		t.hl = hl
+
+		local g = Instance.new("BillboardGui")
+		g.Size = UDim2.fromOffset(180, 30)
+		g.StudsOffset = Vector3.new(0, 3, 0)
+		g.AlwaysOnTop = true
+		local l = Instance.new("TextLabel")
+		l.Size = UDim2.fromScale(1, 1)
+		l.BackgroundTransparency = 1
+		l.TextStrokeTransparency = 0
+		l.TextScaled = true
+		l.Font = Enum.Font.GothamBold
+		l.Parent = g
+		g.Parent = model
+		t.gui, t.label = g, l
+	end
+
+	t.hl.FillColor = color
+	t.hl.OutlineColor = color
+	t.hl.FillTransparency = settings.fill and 0.6 or 1
+	t.label.TextColor3 = color
+	if not t.gui.Adornee then t.gui.Adornee = pickPart(model) end
+
+	t.name = displayName(model, t)
+	t.label.Text = t.name
+	t.text = t.name
+	t.far = nil
+	t.hl.Enabled = true
+	t.gui.Enabled = true
 end
 
 local function clear(model)
 	local t = tracked[model]
 	if not t then return end
-	if t.highlight then t.highlight:Destroy() end
-	if t.gui then t.gui:Destroy() end
+	removeVisuals(t)
 	for _, c in ipairs(t.conns) do c:Disconnect() end
 	tracked[model] = nil
-	dbg("cleared", model.Name)
 end
 
-local function evaluate(model)
+-- Re-classify one target (only called when something relevant changed)
+local function refresh(model)
 	local t = tracked[model]
 	if not t then return end
-
-	if not enabled then
-		if t.detector then hide(t) end
-		return
-	end
-
-	local player = getPlayer(model)
-	if player == LocalPlayer then return end
-
-	local found
-	for _, d in ipairs(DETECTORS) do
-		local ok, res = pcall(d.check, model, player)
-		if not ok then
-			warn("[PiggyESP] detector error (" .. d.label .. "):", res)
-		elseif res then
-			found = d
-			break
+	local cat = classify(model, t)
+	if cat == t.cat then
+		if t.cat and not t.hl and masterOn and on[t.cat] and model.Parent then
+			applyVisuals(model, t)
+		elseif t.gui and not t.gui.Adornee then
+			t.gui.Adornee = pickPart(model)
 		end
-	end
-
-	if not found then
-		if t.detector then hide(t) end
 		return
 	end
-
-	-- nothing changed since last time: do no work
-	if t.detector == found then
-		if t.gui and not t.gui.Adornee then t.gui.Adornee = pickPart(model) end
-		return
-	end
-
-	dbg("flagged", model.Name, "as", found.label)
-	t.detector = found
-	t.text = nil
-
-	if not t.highlight then
-		local hl = Instance.new("Highlight")
-		hl.Adornee = model
-		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-		hl.FillTransparency = 0.6
-		hl.Parent = model
-		t.highlight = hl
-
-		local gui = Instance.new("BillboardGui")
-		gui.Size = UDim2.fromOffset(160, 36)
-		gui.StudsOffset = Vector3.new(0, 3, 0)
-		gui.AlwaysOnTop = true
-		local lbl = Instance.new("TextLabel")
-		lbl.Size = UDim2.fromScale(1, 1)
-		lbl.BackgroundTransparency = 1
-		lbl.TextStrokeTransparency = 0
-		lbl.TextScaled = true
-		lbl.Parent = gui
-		gui.Parent = model
-		t.gui, t.label = gui, lbl
-	end
-
-	if not t.gui.Adornee then t.gui.Adornee = pickPart(model) end
-
-	t.highlight.FillColor = found.color
-	t.highlight.OutlineColor = found.color
-	t.label.TextColor3 = found.color
-	t.label.Text = found.label
-	t.highlight.Enabled = true
-	t.gui.Enabled = true
+	t.cat = cat
+	applyVisuals(model, t)
 end
 
-local function track(model)
+local function track(model, source, direct)
 	if not model or tracked[model] then return end
 	if not (model:IsA("Model") or model:IsA("BasePart")) then return end
-	local t = { conns = {} }
+
+	local t = { source = source, direct = direct, conns = {} }
 	tracked[model] = t
-	dbg("tracking", model.Name)
+	local conns = t.conns
 
-	local function re() evaluate(model) end
-	table.insert(t.conns, model.ChildAdded:Connect(function(c)
-		if MARKERS[c.Name] then re() end
-	end))
-	table.insert(t.conns, model.ChildRemoved:Connect(function(c)
-		if MARKERS[c.Name] then re() end
-	end))
-	table.insert(t.conns, model.AncestryChanged:Connect(function(_, parent)
-		if not parent then clear(model) else re() end
-	end))
-	re()
+	if source == "player" then
+		-- role changes show up as an Enemy / Traitor child appearing or leaving
+		conns[#conns + 1] = model.ChildAdded:Connect(function(c)
+			if MARKERS[c.Name] then refresh(model) end
+		end)
+		conns[#conns + 1] = model.ChildRemoved:Connect(function(c)
+			if MARKERS[c.Name] then refresh(model) end
+		end)
+	else
+		-- names can change (e.g. number -> real item name)
+		conns[#conns + 1] = model:GetPropertyChangedSignal("Name"):Connect(function()
+			local tt = tracked[model]
+			if not tt then return end
+			tt.cat = classify(model, tt)
+			applyVisuals(model, tt)
+		end)
+	end
+
+	conns[#conns + 1] = model.AncestryChanged:Connect(function()
+		if not model:IsDescendantOf(workspace) then
+			clear(model)
+		else
+			local tt = tracked[model]
+			if tt and tt.cat and not tt.hl then applyVisuals(model, tt) end
+		end
+	end)
+
+	refresh(model)
+end
+
+local function refreshAll()
+	for model, t in pairs(tracked) do applyVisuals(model, t) end
 end
 
 --------------------------------------------------------------------
--- 3. Sources of targets
+-- Distance / hide-far tick (5 times a second, skipped when not needed)
 --------------------------------------------------------------------
--- Bots: everything that appears directly in workspace.PiggyNpc
-local watchedFolders = {}
-local function watchBotFolder(folder)
-	if watchedFolders[folder] then return end
-	watchedFolders[folder] = true
-	dbg("watching PiggyNpc folder")
-	folder.ChildAdded:Connect(function(child)
-		task.defer(track, child)
-	end)
-	for _, child in ipairs(folder:GetChildren()) do track(child) end
-end
+local function tick()
+	if not masterOn or not (settings.distance or settings.hideFar) then return end
+	local char = LocalPlayer.Character
+	local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+	if not myRoot then return end
+	local myPos = myRoot.Position
+	local hideFar, farDist, showDist = settings.hideFar, settings.farDist, settings.distance
 
-for _, c in ipairs(workspace:GetChildren()) do
-	if c.Name:lower() == "piggynpc" then watchBotFolder(c) end
-end
-
--- Traps: letter-named items inside the trap folder (parts and NPC models)
-local function considerTrap(folder, d)
-	if not d.Parent then return end
-	if not (d:IsA("Model") or d:IsA("BasePart")) then return end
-	if not isTrapName(d.Name) then return end
-	-- skip pieces inside a trap that is already being tracked
-	local p = d.Parent
-	while p and p ~= folder do
-		if trapTargets[p] then return end
-		p = p.Parent
-	end
-	trapTargets[d] = true
-	dbg("trap found:", d:GetFullName(), d.ClassName)
-	track(d)
-end
-
-local function watchTrapFolder(folder)
-	if watchedTrapFolders[folder] then return end
-	watchedTrapFolders[folder] = true
-	dbg("watching trap folder", folder.Name, folder.ClassName)
-	folder.DescendantAdded:Connect(function(d)
-		task.defer(considerTrap, folder, d)
-	end)
-	for _, d in ipairs(folder:GetDescendants()) do considerTrap(folder, d) end
-end
-local function hookTrapFolderCandidate(inst)
-	if isTrapFolder(inst) then watchTrapFolder(inst) end
-	-- the game renames this folder sometimes, so re-check whenever its name changes
-	inst:GetPropertyChangedSignal("Name"):Connect(function()
-		if isTrapFolder(inst) then watchTrapFolder(inst) end
-	end)
-end
-for _, c in ipairs(workspace:GetChildren()) do
-	if c:IsA("Folder") then hookTrapFolderCandidate(c) end
-end
-
--- Players: every other player's character
-local function watchPlayer(player)
-	if player == LocalPlayer then return end
-	player.CharacterAdded:Connect(function(char)
-		task.defer(track, char)
-	end)
-	if player.Character then track(player.Character) end
-end
-for _, p in ipairs(Players:GetPlayers()) do watchPlayer(p) end
-Players.PlayerAdded:Connect(watchPlayer)
-
--- Workspace children: a (re)created PiggyNpc folder, or a player model that
--- was swapped in without firing CharacterAdded (models sit under the player's name)
-local function onWorkspaceChild(child)
-	if child.Name:lower() == "piggynpc" then
-		watchBotFolder(child)
-	elseif child:IsA("Folder")
-		or (child.Name:match("^%d+$") and not Players:FindFirstChild(child.Name)) then
-		task.defer(hookTrapFolderCandidate, child)
-	elseif child:IsA("Model") and child.Name ~= LocalPlayer.Name and Players:FindFirstChild(child.Name) then
-		task.defer(track, child)
+	for model, t in pairs(tracked) do
+		local hl = t.hl
+		if hl then
+			local r = getRoot(model, t)
+			if r then
+				local d = (r.Position - myPos).Magnitude
+				if hideFar then
+					local far = d > farDist
+					if far ~= t.far then
+						t.far = far
+						hl.Enabled = not far
+						t.gui.Enabled = not far
+					end
+				elseif t.far then
+					t.far = false
+					hl.Enabled = true
+					t.gui.Enabled = true
+				end
+				if showDist and not t.far then
+					local text = string.format("%s [%d]", t.name, math.floor(d))
+					if text ~= t.text then
+						t.text = text
+						t.label.Text = text
+					end
+				end
+			end
+		end
 	end
 end
-workspace.ChildAdded:Connect(onWorkspaceChild)
-for _, child in ipairs(workspace:GetChildren()) do
-	if child:IsA("Model") then onWorkspaceChild(child) end
+
+local function applySettings()
+	refreshAll()
+	tick()
 end
 
--- Safety net: cheap re-check of tracked models once a second
-task.spawn(function()
-	while true do
-		task.wait(1)
-		for model in pairs(tracked) do evaluate(model) end
-	end
-end)
-
--- Distance text: 5 times a second, only touches the label when the text changes
 local acc = 0
 RunService.Heartbeat:Connect(function(dt)
 	acc += dt
 	if acc < 0.2 then return end
 	acc = 0
-	if not enabled then return end
-	local char = LocalPlayer.Character
-	local myRoot = char and char:FindFirstChild("HumanoidRootPart")
-	if not myRoot then return end
-	local myPos = myRoot.Position
-	for model, t in pairs(tracked) do
-		local det = t.detector
-		if det and t.label then
-			local r = t.root
-			if not r or not r.Parent then
-				if model:IsA("BasePart") then
-					r = model
-				else
-					r = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
-				end
-				t.root = r
-			end
-			if r then
-				local text = string.format("%s [%d]", det.label, (r.Position - myPos).Magnitude)
-				if t.text ~= text then
-					t.text = text
-					t.label.Text = text
-				end
-			end
-		end
-	end
+	tick()
 end)
 
 --------------------------------------------------------------------
--- 4. Toggle: key + on-screen button
+-- Sources of targets
 --------------------------------------------------------------------
-local button -- created below
-
-local function setEnabled(v)
-	enabled = v
-	dbg("enabled =", enabled)
-	for model in pairs(tracked) do evaluate(model) end
-	if button then
-		button.Text = enabled and "ESP: ON" or "ESP: OFF"
-		button.BackgroundColor3 = enabled and Color3.fromRGB(40, 160, 70) or Color3.fromRGB(170, 50, 50)
-	end
+-- Bots: direct children of workspace.PiggyNpc
+local watchedBotFolders = {}
+local function watchBotFolder(folder)
+	if watchedBotFolders[folder] then return end
+	watchedBotFolders[folder] = true
+	dbg("watching PiggyNpc")
+	folder.ChildAdded:Connect(function(child)
+		task.defer(track, child, "bot", true)
+	end)
+	for _, child in ipairs(folder:GetChildren()) do track(child, "bot", true) end
 end
 
-UserInputService.InputBegan:Connect(function(input, processed)
-	if processed or input.KeyCode ~= TOGGLE_KEY then return end
-	setEnabled(not enabled)
+-- Item folder: traps, abilities and items
+local watchedItemFolders = {}
+local function isItemFolder(inst)
+	if Players:FindFirstChild(inst.Name) then return false end
+	return inst.Name == "ItemFolder" or inst.Name:match("^%d+$") ~= nil
+end
+
+local function considerFolderChild(folder, d)
+	if not d.Parent then return end
+	if not (d:IsA("Model") or d:IsA("BasePart")) then return end
+	-- skip pieces inside something we already track
+	local p = d.Parent
+	while p and p ~= folder do
+		if tracked[p] then return end
+		p = p.Parent
+	end
+	local direct = (d.Parent == folder)
+	if not direct then
+		-- deeper things only count if they are traps or abilities (never plain items)
+		local lname = d.Name:lower()
+		if not (hasKeyword(lname, TRAP_KEYWORDS) or hasKeyword(lname, NPC_TRAP_NAMES)
+			or hasKeyword(lname, ABILITY_KEYWORDS)) then
+			return
+		end
+	end
+	track(d, "folder", direct)
+end
+
+local function watchItemFolder(folder)
+	if watchedItemFolders[folder] then return end
+	watchedItemFolders[folder] = true
+	dbg("watching item folder", folder.Name)
+	folder.DescendantAdded:Connect(function(d)
+		task.defer(considerFolderChild, folder, d)
+	end)
+	for _, d in ipairs(folder:GetDescendants()) do considerFolderChild(folder, d) end
+end
+
+local function hookItemFolderCandidate(inst)
+	if isItemFolder(inst) then watchItemFolder(inst) end
+	-- the game renames this folder, so re-check if its name changes
+	inst:GetPropertyChangedSignal("Name"):Connect(function()
+		if isItemFolder(inst) then watchItemFolder(inst) end
+	end)
+end
+
+-- Players: other players' characters
+local function watchPlayer(player)
+	if player == LocalPlayer then return end
+	player.CharacterAdded:Connect(function(char)
+		task.defer(track, char, "player")
+	end)
+	if player.Character then track(player.Character, "player") end
+end
+for _, p in ipairs(Players:GetPlayers()) do watchPlayer(p) end
+Players.PlayerAdded:Connect(watchPlayer)
+
+-- Workspace children: PiggyNpc, the item folder, and player models by name
+local function onWorkspaceChild(child)
+	if child.Name:lower() == "piggynpc" then
+		watchBotFolder(child)
+	elseif child:IsA("Folder")
+		or (child.Name:match("^%d+$") and not Players:FindFirstChild(child.Name)) then
+		task.defer(hookItemFolderCandidate, child)
+	elseif child:IsA("Model") and child.Name ~= LocalPlayer.Name and Players:FindFirstChild(child.Name) then
+		task.defer(track, child, "player")
+	end
+end
+workspace.ChildAdded:Connect(onWorkspaceChild)
+for _, child in ipairs(workspace:GetChildren()) do onWorkspaceChild(child) end
+
+-- Safety net for player roles only (1 check per second per player)
+task.spawn(function()
+	while true do
+		task.wait(1)
+		for model, t in pairs(tracked) do
+			if t.source == "player" then refresh(model) end
+		end
+	end
 end)
 
--- On-screen toggle button (click to toggle, drag to move)
+--------------------------------------------------------------------
+-- Menu (phone friendly): small ESP button opens the panel
+--------------------------------------------------------------------
 task.spawn(function()
-	local gui = Instance.new("ScreenGui")
-	gui.Name = "PiggyESPToggle"
-	gui.ResetOnSpawn = false
-	gui.DisplayOrder = 999
+	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-	button = Instance.new("TextButton")
-	button.Size = UDim2.fromOffset(110, 36)
-	button.Position = UDim2.new(1, -126, 0, 70)
-	button.AutoButtonColor = false
-	button.Font = Enum.Font.GothamBold
-	button.TextSize = 16
-	button.TextColor3 = Color3.new(1, 1, 1)
-	button.Text = enabled and "ESP: ON" or "ESP: OFF"
-	button.BackgroundColor3 = enabled and Color3.fromRGB(40, 160, 70) or Color3.fromRGB(170, 50, 50)
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 8)
-	corner.Parent = button
-	button.Parent = gui
+	local ON_COLOR = Color3.fromRGB(40, 160, 70)
+	local OFF_COLOR = Color3.fromRGB(160, 50, 50)
+	local WHITE = Color3.new(1, 1, 1)
 
-	local dragStart, startPos, moved
-	local function isPointer(input)
-		return input.UserInputType == Enum.UserInputType.MouseButton1
-			or input.UserInputType == Enum.UserInputType.Touch
+	local sg = Instance.new("ScreenGui")
+	sg.Name = "PiggyESPMenu"
+	sg.ResetOnSpawn = false
+	sg.DisplayOrder = 999
+	sg.IgnoreGuiInset = true
+
+	local function round(inst, r)
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(0, r or 8)
+		c.Parent = inst
 	end
 
-	button.InputBegan:Connect(function(input)
-		if isPointer(input) then
-			dragStart = input.Position
-			startPos = button.Position
-			moved = false
-		end
-	end)
-	UserInputService.InputChanged:Connect(function(input)
-		if not dragStart then return end
-		if input.UserInputType == Enum.UserInputType.MouseMovement
-			or input.UserInputType == Enum.UserInputType.Touch then
-			local delta = input.Position - dragStart
-			if delta.Magnitude > 6 then moved = true end
-			if moved then
-				button.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
-					startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-			end
-		end
-	end)
-	button.InputEnded:Connect(function(input)
-		if isPointer(input) then
-			if dragStart and not moved then setEnabled(not enabled) end
-			dragStart = nil
-		end
-	end)
+	-- Drag helper: follows ONLY the finger/pointer that started on the handle,
+	-- ignores other fingers, clamps to the screen, tap (no movement) = onTap.
+	local function makeDraggable(handle, target, onTap)
+		local activeInput, startInputPos, startPos, moved
+		local MOUSE = Enum.UserInputType.MouseButton1
+		local TOUCH = Enum.UserInputType.Touch
 
-	gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+		handle.InputBegan:Connect(function(input)
+			if activeInput then return end
+			if input.UserInputType == TOUCH or input.UserInputType == MOUSE then
+				activeInput = input
+				startInputPos = Vector2.new(input.Position.X, input.Position.Y)
+				startPos = target.Position
+				moved = false
+			end
+		end)
+
+		UserInputService.InputChanged:Connect(function(input)
+			if not activeInput then return end
+			local match = (input == activeInput)
+				or (activeInput.UserInputType == MOUSE and input.UserInputType == Enum.UserInputType.MouseMovement)
+			if not match then return end
+			local delta = Vector2.new(input.Position.X, input.Position.Y) - startInputPos
+			if not moved and delta.Magnitude < 10 then return end
+			moved = true
+			local screen = sg.AbsoluteSize
+			local size = target.AbsoluteSize
+			local x = math.clamp(startPos.X.Offset + delta.X, 0, math.max(0, screen.X - size.X))
+			local y = math.clamp(startPos.Y.Offset + delta.Y, 0, math.max(0, screen.Y - size.Y))
+			target.Position = UDim2.fromOffset(x, y)
+		end)
+
+		UserInputService.InputEnded:Connect(function(input)
+			if not activeInput then return end
+			local match = (input == activeInput)
+				or (activeInput.UserInputType == MOUSE and input.UserInputType == MOUSE)
+			if not match then return end
+			local wasTap = not moved
+			activeInput = nil
+			if wasTap and onTap then onTap() end
+		end)
+	end
+
+	-- Floating button
+	local fab = Instance.new("TextButton")
+	fab.Name = "ESPButton"
+	fab.Size = UDim2.fromOffset(52, 40)
+	fab.Position = UDim2.fromOffset(12, 80)
+	fab.AutoButtonColor = false
+	fab.Font = Enum.Font.GothamBold
+	fab.TextSize = 16
+	fab.TextColor3 = WHITE
+	fab.Text = "ESP"
+	fab.Parent = sg
+	round(fab, 10)
+
+	local function paintFab()
+		fab.BackgroundColor3 = masterOn and ON_COLOR or OFF_COLOR
+	end
+
+	-- Panel
+	local cam = workspace.CurrentCamera
+	local viewport = cam and cam.ViewportSize or Vector2.new(800, 400)
+	local panelH = math.min(330, viewport.Y - 24)
+
+	local panel = Instance.new("Frame")
+	panel.Name = "ESPPanel"
+	panel.Size = UDim2.fromOffset(250, panelH)
+	panel.Position = UDim2.fromOffset(72, 12)
+	panel.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
+	panel.BackgroundTransparency = 0.05
+	panel.Visible = false
+	panel.Parent = sg
+	round(panel, 10)
+
+	local titleBar = Instance.new("TextButton")
+	titleBar.Size = UDim2.new(1, 0, 0, 30)
+	titleBar.AutoButtonColor = false
+	titleBar.BackgroundColor3 = Color3.fromRGB(45, 45, 56)
+	titleBar.Font = Enum.Font.GothamBold
+	titleBar.TextSize = 13
+	titleBar.TextColor3 = WHITE
+	titleBar.Text = "ESP menu  (drag here to move)"
+	titleBar.Parent = panel
+	round(titleBar, 10)
+
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Position = UDim2.fromOffset(0, 34)
+	scroll.Size = UDim2.new(1, 0, 1, -38)
+	scroll.BackgroundTransparency = 1
+	scroll.BorderSizePixel = 0
+	scroll.ScrollBarThickness = 4
+	scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	scroll.CanvasSize = UDim2.new()
+	scroll.Parent = panel
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 4)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = scroll
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 8)
+	pad.PaddingRight = UDim.new(0, 10)
+	pad.PaddingTop = UDim.new(0, 2)
+	pad.PaddingBottom = UDim.new(0, 6)
+	pad.Parent = scroll
+
+	local order = 0
+	local function nextOrder()
+		order += 1
+		return order
+	end
+
+	local function header(text)
+		local h = Instance.new("TextLabel")
+		h.Size = UDim2.new(1, 0, 0, 22)
+		h.BackgroundTransparency = 1
+		h.Font = Enum.Font.GothamBold
+		h.TextSize = 12
+		h.TextColor3 = Color3.fromRGB(170, 170, 185)
+		h.TextXAlignment = Enum.TextXAlignment.Left
+		h.Text = text
+		h.LayoutOrder = nextOrder()
+		h.Parent = scroll
+	end
+
+	local function toggleRow(text, textColor, get, set)
+		local row = Instance.new("Frame")
+		row.Size = UDim2.new(1, 0, 0, 30)
+		row.BackgroundTransparency = 1
+		row.LayoutOrder = nextOrder()
+		row.Parent = scroll
+
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(1, -72, 1, 0)
+		lbl.BackgroundTransparency = 1
+		lbl.Font = Enum.Font.GothamMedium
+		lbl.TextSize = 14
+		lbl.TextColor3 = textColor
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.Text = text
+		lbl.Parent = row
+
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.fromOffset(64, 26)
+		btn.AnchorPoint = Vector2.new(1, 0.5)
+		btn.Position = UDim2.new(1, 0, 0.5, 0)
+		btn.AutoButtonColor = false
+		btn.Font = Enum.Font.GothamBold
+		btn.TextSize = 13
+		btn.TextColor3 = WHITE
+		btn.Parent = row
+		round(btn, 8)
+
+		local function paint()
+			local s = get()
+			btn.Text = s and "ON" or "OFF"
+			btn.BackgroundColor3 = s and ON_COLOR or OFF_COLOR
+		end
+		btn.Activated:Connect(function()
+			set(not get())
+			paint()
+		end)
+		paint()
+	end
+
+	-- Master switch
+	toggleRow("ESP (everything)", WHITE,
+		function() return masterOn end,
+		function(v)
+			masterOn = v
+			paintFab()
+			applySettings()
+		end)
+
+	header("ESP TYPES")
+	for _, c in ipairs(CATEGORIES) do
+		toggleRow(c.label, c.color,
+			function() return on[c.key] end,
+			function(v)
+				on[c.key] = v
+				applySettings()
+			end)
+	end
+
+	header("SETTINGS")
+	toggleRow("Fill (colored body)", WHITE,
+		function() return settings.fill end,
+		function(v) settings.fill = v applySettings() end)
+	toggleRow("Show distance", WHITE,
+		function() return settings.distance end,
+		function(v) settings.distance = v applySettings() end)
+	toggleRow("Hide far away", WHITE,
+		function() return settings.hideFar end,
+		function(v) settings.hideFar = v applySettings() end)
+
+	-- Far distance row with - / + buttons
+	do
+		local row = Instance.new("Frame")
+		row.Size = UDim2.new(1, 0, 0, 30)
+		row.BackgroundTransparency = 1
+		row.LayoutOrder = nextOrder()
+		row.Parent = scroll
+
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(1, -84, 1, 0)
+		lbl.BackgroundTransparency = 1
+		lbl.Font = Enum.Font.GothamMedium
+		lbl.TextSize = 14
+		lbl.TextColor3 = WHITE
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.Parent = row
+
+		local function paint()
+			lbl.Text = "Hide beyond " .. settings.farDist
+		end
+
+		local function stepButton(text, xOffset, delta)
+			local b = Instance.new("TextButton")
+			b.Size = UDim2.fromOffset(38, 26)
+			b.AnchorPoint = Vector2.new(1, 0.5)
+			b.Position = UDim2.new(1, xOffset, 0.5, 0)
+			b.AutoButtonColor = false
+			b.BackgroundColor3 = Color3.fromRGB(70, 70, 90)
+			b.Font = Enum.Font.GothamBold
+			b.TextSize = 18
+			b.TextColor3 = WHITE
+			b.Text = text
+			b.Parent = row
+			round(b, 8)
+			b.Activated:Connect(function()
+				settings.farDist = math.clamp(settings.farDist + delta, 25, 1000)
+				paint()
+				applySettings()
+			end)
+		end
+		stepButton("+", 0, 25)
+		stepButton("-", -44, -25)
+		paint()
+	end
+
+	makeDraggable(fab, fab, function() panel.Visible = not panel.Visible end)
+	makeDraggable(titleBar, panel, nil)
+
+	paintFab()
+	sg.Parent = playerGui
 end)
 
 dbg("started")
