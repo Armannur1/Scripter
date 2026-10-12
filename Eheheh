@@ -14,14 +14,15 @@ local TOGGLE_KEY = Enum.KeyCode.RightShift -- change to any key you like
 local DEBUG = false
 local enabled = true
 
--- Trap folder: a Folder directly in workspace whose name is all digits (the number
--- changes every time). Traps have letters in their name; other items are numbers only.
+-- Trap container: something directly in workspace whose name is all digits (the number
+-- changes every time). Anything inside it with "trap" in its name (any depth) is a trap.
 local function isTrapFolder(inst)
-	return inst:IsA("Folder") and inst.Name:match("^%d+$") ~= nil
+	return inst.Name:match("^%d+$") ~= nil and not Players:FindFirstChild(inst.Name)
 end
 local watchedTrapFolders = {} -- [folder] = true
+local trapTargets = setmetatable({}, { __mode = "k" }) -- [instance] = true
 local function isTrapName(name)
-	return name:find("%a") ~= nil
+	return name:lower():find("trap") ~= nil
 end
 
 local function dbg(...)
@@ -56,16 +57,14 @@ local DETECTORS = {
 		label = "Trap (Object)", color = Color3.fromRGB(255, 220, 0),
 		check = function(model, player)
 			local parent = model.Parent
-			return parent ~= nil and watchedTrapFolders[parent] == true
-				and model:IsA("BasePart") and isTrapName(model.Name)
+			return trapTargets[model] == true and model:IsA("BasePart")
 		end,
 	},
 	{
 		label = "Trap (NPC)", color = Color3.fromRGB(0, 220, 255),
 		check = function(model, player)
 			local parent = model.Parent
-			return parent ~= nil and watchedTrapFolders[parent] == true
-				and model:IsA("Model") and isTrapName(model.Name)
+			return trapTargets[model] == true and model:IsA("Model")
 		end,
 	},
 }
@@ -222,18 +221,29 @@ for _, c in ipairs(workspace:GetChildren()) do
 end
 
 -- Traps: letter-named items inside the trap folder (parts and NPC models)
+local function considerTrap(folder, d)
+	if not d.Parent then return end
+	if not (d:IsA("Model") or d:IsA("BasePart")) then return end
+	if not isTrapName(d.Name) then return end
+	-- skip pieces inside a trap that is already being tracked
+	local p = d.Parent
+	while p and p ~= folder do
+		if trapTargets[p] then return end
+		p = p.Parent
+	end
+	trapTargets[d] = true
+	dbg("trap found:", d:GetFullName(), d.ClassName)
+	track(d)
+end
+
 local function watchTrapFolder(folder)
 	if watchedTrapFolders[folder] then return end
 	watchedTrapFolders[folder] = true
-	dbg("watching trap folder")
-	folder.ChildAdded:Connect(function(child)
-		task.defer(function()
-			if isTrapName(child.Name) then track(child) end
-		end)
+	dbg("watching trap folder", folder.Name, folder.ClassName)
+	folder.DescendantAdded:Connect(function(d)
+		task.defer(considerTrap, folder, d)
 	end)
-	for _, child in ipairs(folder:GetChildren()) do
-		if isTrapName(child.Name) then track(child) end
-	end
+	for _, d in ipairs(folder:GetDescendants()) do considerTrap(folder, d) end
 end
 for _, c in ipairs(workspace:GetChildren()) do
 	if isTrapFolder(c) then watchTrapFolder(c) end
@@ -255,7 +265,7 @@ Players.PlayerAdded:Connect(watchPlayer)
 local function onWorkspaceChild(child)
 	if child.Name:lower() == "piggynpc" then
 		watchBotFolder(child)
-	elseif child:IsA("Folder") then
+	elseif child.Name:match("^%d+$") and not Players:FindFirstChild(child.Name) then
 		task.defer(function()
 			if isTrapFolder(child) then watchTrapFolder(child) end
 		end)
