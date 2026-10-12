@@ -21,8 +21,18 @@ local function isTrapFolder(inst)
 end
 local watchedTrapFolders = {} -- [folder] = true
 local trapTargets = setmetatable({}, { __mode = "k" }) -- [instance] = true
+-- Edit these lists to tune what counts as a trap (not case sensitive, matches part of the name)
+local TRAP_KEYWORDS = { "trap", "piggy" }
+local TRAP_EXCLUDE = {} -- e.g. { "trapdoor", "poster" } to ignore items you don't want marked
 local function isTrapName(name)
-	return name:lower():find("trap") ~= nil
+	local n = name:lower()
+	for _, ex in ipairs(TRAP_EXCLUDE) do
+		if n:find(ex, 1, true) then return false end
+	end
+	for _, kw in ipairs(TRAP_KEYWORDS) do
+		if n:find(kw, 1, true) then return true end
+	end
+	return false
 end
 
 local function dbg(...)
