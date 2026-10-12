@@ -17,7 +17,8 @@ local enabled = true
 -- Trap container: something directly in workspace whose name is all digits (the number
 -- changes every time). Anything inside it with "trap" in its name (any depth) is a trap.
 local function isTrapFolder(inst)
-	return inst.Name:match("^%d+$") ~= nil and not Players:FindFirstChild(inst.Name)
+	if Players:FindFirstChild(inst.Name) then return false end
+	return inst.Name == "ItemFolder" or inst.Name:match("^%d+$") ~= nil
 end
 local watchedTrapFolders = {} -- [folder] = true
 local trapTargets = setmetatable({}, { __mode = "k" }) -- [instance] = true
@@ -255,8 +256,15 @@ local function watchTrapFolder(folder)
 	end)
 	for _, d in ipairs(folder:GetDescendants()) do considerTrap(folder, d) end
 end
+local function hookTrapFolderCandidate(inst)
+	if isTrapFolder(inst) then watchTrapFolder(inst) end
+	-- the game renames this folder sometimes, so re-check whenever its name changes
+	inst:GetPropertyChangedSignal("Name"):Connect(function()
+		if isTrapFolder(inst) then watchTrapFolder(inst) end
+	end)
+end
 for _, c in ipairs(workspace:GetChildren()) do
-	if isTrapFolder(c) then watchTrapFolder(c) end
+	if c:IsA("Folder") then hookTrapFolderCandidate(c) end
 end
 
 -- Players: every other player's character
@@ -275,10 +283,9 @@ Players.PlayerAdded:Connect(watchPlayer)
 local function onWorkspaceChild(child)
 	if child.Name:lower() == "piggynpc" then
 		watchBotFolder(child)
-	elseif child.Name:match("^%d+$") and not Players:FindFirstChild(child.Name) then
-		task.defer(function()
-			if isTrapFolder(child) then watchTrapFolder(child) end
-		end)
+	elseif child:IsA("Folder")
+		or (child.Name:match("^%d+$") and not Players:FindFirstChild(child.Name)) then
+		task.defer(hookTrapFolderCandidate, child)
 	elseif child:IsA("Model") and child.Name ~= LocalPlayer.Name and Players:FindFirstChild(child.Name) then
 		task.defer(track, child)
 	end
