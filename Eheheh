@@ -27,13 +27,15 @@ end
 -- CONFIG (edit freely)
 --------------------------------------------------------------------
 local CATEGORIES = {
-	{ key = "player",  label = "Player piggy", color = Color3.fromRGB(255, 50, 50),  default = true },
-	{ key = "bot",     label = "Bot piggy",    color = Color3.fromRGB(60, 130, 255), default = true },
-	{ key = "trap",    label = "Trap",         color = Color3.fromRGB(170, 80, 255), default = true },
-	{ key = "npctrap", label = "NPC trap",     color = Color3.fromRGB(150, 0, 0),    default = true },
-	{ key = "traitor", label = "Traitor",      color = Color3.fromRGB(255, 140, 0),  default = true },
-	{ key = "ability", label = "Ability",      color = Color3.fromRGB(60, 220, 90),  default = false },
-	{ key = "item",    label = "Item",         color = Color3.fromRGB(255, 225, 40), default = false },
+	{ key = "survivor", label = "Survivor",     color = Color3.fromRGB(0, 230, 230),   default = false },
+	{ key = "player",   label = "Player piggy", color = Color3.fromRGB(255, 50, 50),   default = false },
+	{ key = "bot",      label = "Bot piggy",    color = Color3.fromRGB(60, 130, 255),  default = false },
+	{ key = "trap",     label = "Trap",         color = Color3.fromRGB(170, 80, 255),  default = false },
+	{ key = "npctrap",  label = "NPC trap",     color = Color3.fromRGB(150, 0, 0),     default = false },
+	{ key = "traitor",  label = "Traitor",      color = Color3.fromRGB(255, 140, 0),   default = false },
+	{ key = "ghost",    label = "Ghost",        color = Color3.fromRGB(235, 235, 255), default = false },
+	{ key = "ability",  label = "Ability",      color = Color3.fromRGB(60, 220, 90),   default = false },
+	{ key = "item",     label = "Item",         color = Color3.fromRGB(255, 225, 40),  default = false },
 }
 
 -- Settings defaults
@@ -42,6 +44,7 @@ local settings = {
 	distance = true,   -- show [distance] in labels
 	hideFar = false,   -- hide outlines/labels beyond farDist
 	farDist = 150,     -- studs (changeable in the menu, steps of 25)
+	textSize = 18,     -- label text size (changeable in the menu)
 }
 
 -- Name matching (not case sensitive, matches part of the name)
@@ -60,7 +63,7 @@ for _, c in ipairs(CATEGORIES) do
 	COLOR[c.key] = c.color
 end
 
-local MARKERS = { Enemy = true, Traitor = true }
+local MARKERS = { Enemy = true, Traitor = true, Ghost = true }
 local tracked = {} -- [instance] = {source, direct, cat, name, hl, gui, label, root, text, far, conns}
 
 --------------------------------------------------------------------
@@ -109,6 +112,7 @@ local function displayName(model, t)
 		local p = getPlayer(model)
 		return p and p.Name or model.Name
 	end
+	if t.source == "bot" and model:FindFirstChild("DisarmNPCScript", true) then return "Disarm" end
 	local n = model.Name
 	if n:match("^%d+$") then return "Item" end
 	return n
@@ -120,14 +124,17 @@ end
 local function classify(model, t)
 	local src = t.source
 	if src == "player" then
+		-- Ghosts also carry an Enemy tag, so Ghost is checked first
+		if model:FindFirstChild("Ghost") then return "ghost" end
 		if model:FindFirstChild("Traitor") then return "traitor" end
 		if model:FindFirstChild("Enemy") then return "player" end
-		return nil
+		return "survivor"
 	end
 
 	local lname = model.Name:lower()
 
 	if src == "bot" then
+		if model:FindFirstChild("DisarmNPCScript", true) then return "ability" end -- Disarm
 		if hasKeyword(lname, ABILITY_KEYWORDS) then return "ability" end -- "Decoy" lives here
 		return "bot"
 	end
@@ -169,14 +176,15 @@ local function applyVisuals(model, t)
 		t.hl = hl
 
 		local g = Instance.new("BillboardGui")
-		g.Size = UDim2.fromOffset(180, 30)
+		g.Size = UDim2.fromOffset(260, 40)
 		g.StudsOffset = Vector3.new(0, 3, 0)
 		g.AlwaysOnTop = true
 		local l = Instance.new("TextLabel")
 		l.Size = UDim2.fromScale(1, 1)
 		l.BackgroundTransparency = 1
 		l.TextStrokeTransparency = 0
-		l.TextScaled = true
+		l.TextScaled = false
+		l.TextWrapped = false
 		l.Font = Enum.Font.GothamBold
 		l.Parent = g
 		g.Parent = model
@@ -187,6 +195,7 @@ local function applyVisuals(model, t)
 	t.hl.OutlineColor = color
 	t.hl.FillTransparency = settings.fill and 0.6 or 1
 	t.label.TextColor3 = color
+	t.label.TextSize = settings.textSize
 	if not t.gui.Adornee then t.gui.Adornee = pickPart(model) end
 
 	t.name = displayName(model, t)
@@ -239,13 +248,20 @@ local function track(model, source, direct)
 			if MARKERS[c.Name] then refresh(model) end
 		end)
 	else
-		-- names can change (e.g. number -> real item name)
-		conns[#conns + 1] = model:GetPropertyChangedSignal("Name"):Connect(function()
+		local function reclassify()
 			local tt = tracked[model]
 			if not tt then return end
 			tt.cat = classify(model, tt)
 			applyVisuals(model, tt)
-		end)
+		end
+		-- names can change (e.g. number -> real item name)
+		conns[#conns + 1] = model:GetPropertyChangedSignal("Name"):Connect(reclassify)
+		if source == "bot" then
+			-- the Disarm marker script can be added just after the bot appears
+			conns[#conns + 1] = model.ChildAdded:Connect(function(c)
+				if c.Name == "DisarmNPCScript" then reclassify() end
+			end)
+		end
 	end
 
 	conns[#conns + 1] = model.AncestryChanged:Connect(function()
@@ -675,6 +691,51 @@ task.spawn(function()
 		end
 		stepButton("+", 0, 25)
 		stepButton("-", -44, -25)
+		paint()
+	end
+
+	-- Label text size row with - / + buttons
+	do
+		local row = Instance.new("Frame")
+		row.Size = UDim2.new(1, 0, 0, 30)
+		row.BackgroundTransparency = 1
+		row.LayoutOrder = nextOrder()
+		row.Parent = scroll
+
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(1, -84, 1, 0)
+		lbl.BackgroundTransparency = 1
+		lbl.Font = Enum.Font.GothamMedium
+		lbl.TextSize = 14
+		lbl.TextColor3 = WHITE
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.Parent = row
+
+		local function paint()
+			lbl.Text = "Label text size " .. settings.textSize
+		end
+
+		local function stepButton(text, xOffset, delta)
+			local b = Instance.new("TextButton")
+			b.Size = UDim2.fromOffset(38, 26)
+			b.AnchorPoint = Vector2.new(1, 0.5)
+			b.Position = UDim2.new(1, xOffset, 0.5, 0)
+			b.AutoButtonColor = false
+			b.BackgroundColor3 = Color3.fromRGB(70, 70, 90)
+			b.Font = Enum.Font.GothamBold
+			b.TextSize = 18
+			b.TextColor3 = WHITE
+			b.Text = text
+			b.Parent = row
+			round(b, 8)
+			b.Activated:Connect(function()
+				settings.textSize = math.clamp(settings.textSize + delta, 8, 36)
+				paint()
+				applySettings()
+			end)
+		end
+		stepButton("+", 0, 1)
+		stepButton("-", -44, -1)
 		paint()
 	end
 
